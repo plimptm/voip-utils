@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import time
+import socket
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
@@ -223,6 +224,19 @@ def get_rtp_info(body: str) -> RtpInfo:
 def get_header(headers: dict[str, str], name: str) -> tuple[str, str] | None:
     """Get a header entry using a case insensitive key comparison."""
     return next(((k, v) for k, v in headers.items() if k.lower() == name.lower()), None)
+
+
+def resolve_hostname(hostname: str) -> str:
+    """Resolve hostname to an IPv4 address."""
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
+        for info in addr_info:
+            family, _, _, _, sockaddr = info
+            if family == socket.AF_INET:
+                return sockaddr[0]
+        return addr_info[0][-1][0]  # If no preferred address is found, use the first available address
+    except socket.gaierror:
+        raise VoipError(f"Hostname resolution failed for {hostname}")
 
 
 class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
@@ -471,7 +485,7 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
                     + r"\[?(?P<host>"  # Begin group host
                     + r"(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|"  # IPv4 address Host Or
                     + r"(?:(?:[0-9a-fA-F]{1,4}):){7}[0-9a-fA-F]{1,4}|"  # IPv6 address Host Or
-                    + r"(?:(?:[0-9A-Za-z]+\.)+[0-9A-Za-z]+)"  # Hostname string
+                    + r"(?!-)[a-zA-Z0-9-]{1,63}(?<!-)"  # Hostname string
                     + r")\]?:?"  # End group host
                     + r"(?P<port>\d{1,6})?"  # port
                     + r"(?:\;(?P<params>[^\?]*))?"  # parameters
@@ -481,7 +495,9 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
                 if re_uri is None:
                     raise ValueError("Receiver URI did not match expected pattern")
 
-                server_ip = re_uri.group("host")
+                server_host = re_uri.group("host")
+                if not is_ipv4_address(server_host):
+                    server_ip = resolve_hostname(server_host)
                 if not is_ipv4_address(server_ip):
                     raise VoipError(f"Invalid IPv4 address in {smsg.request_uri}")
 
