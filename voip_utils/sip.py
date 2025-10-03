@@ -491,7 +491,8 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
                     + r"\[?(?P<host>"  # Begin group host
                     + r"(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|"  # IPv4 address Host Or
                     + r"(?:(?:[0-9a-fA-F]{1,4}):){7}[0-9a-fA-F]{1,4}|"  # IPv6 address Host Or
-                    + r"(?!-)[a-zA-Z0-9-]{1,63}(?<!-)"  # Hostname string
+                    + r"(?!-)[a-zA-Z0-9-]{1,63}(?<!-)|"  # Hostname string
+                    + r"(?!-)([a-zA-Z0-9-]{1,63}(?<!-)\.)+[a-zA-Z0-9]{1,63}$" # FQDN string
                     + r")\]?:?"  # End group host
                     + r"(?P<port>\d{1,6})?"  # port
                     + r"(?:\;(?P<params>[^\?]*))?"  # parameters
