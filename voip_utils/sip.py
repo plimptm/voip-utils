@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import secrets
 import time
 import socket
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 from .const import OPUS_PAYLOAD_TYPE
 from .error import VoipError
@@ -44,10 +45,25 @@ class SipEndpoint:
     port: int = field(init=False)
     username: str | None = field(init=False)
     description: str | None = field(init=False)
+    uri_parameters: dict[str, str] | None = field(init=False)
+    uri_headers: dict[str, str] | None = field(init=False)
+    header_parameters: dict[str, str] | None = field(init=False)
 
     def __post_init__(self):
         header_pattern = re.compile(
-            r'\s*((?P<description>\b\w+\b|"[^"]+")\s*)?<?(?P<uri>sips?:[^>]+)>?.*'
+            r"""
+           ^\s*
+           (?:(?P<description>\b[^<\s"]+\b|"[^"]+")\s*)?
+           (?:
+            <(?P<uri_bracketed>sips?:[^>]+)>
+            |
+            (?P<uri_unbracketed>sips?:[^\s;]+)
+           )
+           \s*
+           (?P<header_params>(?:;\s*[^=;]+(?:=[^;]*)?)*)
+           .*$
+        """,
+            re.VERBOSE | re.IGNORECASE,
         )
         header_match = header_pattern.match(self.sip_header)
         if header_match is not None:
@@ -56,9 +72,13 @@ class SipEndpoint:
                 self.description = description_token.strip('"')
             else:
                 self.description = None
-            self.uri = header_match.group("uri")
+            self.uri = (
+                header_match.group("uri_bracketed")
+                if header_match.group("uri_bracketed")
+                else header_match.group("uri_unbracketed")
+            )
             uri_pattern = re.compile(
-                r"(?P<scheme>sips?):(?:(?P<user>[^@]+)@)?(?P<host>[^:;?]+)(?::(?P<port>\d+))?"
+                r"(?P<scheme>sips?):(?:(?P<user>[^@]+)@)?(?P<host>[^:;?]+)(?::(?P<port>\d+))?(?P<params>(?:;[^;=?]+(?:=[^;?]*)?)*)?(?:\?(?P<headers>[^#]*))?"
             )
             uri_match = uri_pattern.match(self.uri)
             if uri_match is None:
@@ -69,8 +89,37 @@ class SipEndpoint:
             self.port = (
                 int(uri_match.group("port")) if uri_match.group("port") else SIP_PORT
             )
+            self.uri_parameters: dict[str, str] = {}
+            if uri_match.group("params"):
+                for param in uri_match.group("params").lstrip(";").split(";"):
+                    if "=" in param:
+                        key, value = param.split("=", 1)
+                        self.uri_parameters[key.strip()] = value.strip()
+                    elif param.strip():
+                        self.uri_parameters[param.strip()] = ""
+            self.uri_headers: dict[str, str] = {}
+            if uri_match.group("headers"):
+                for pair in uri_match.group("headers").split("&"):
+                    if "=" in pair:
+                        key, value = pair.split("=", 1)
+                        self.uri_headers[key.strip()] = value.strip()
+            self.header_parameters: dict[str, str] = {}
+            if header_match.group("header_params"):
+                for param in header_match.group("header_params").lstrip(";").split(";"):
+                    if "=" in param:
+                        key, value = param.split("=", 1)
+                        self.header_parameters[key.strip()] = value.strip()
+                    elif param.strip():
+                        self.header_parameters[param.strip()] = ""
+
         else:
             raise ValueError("Invalid SIP header")
+
+    @property
+    def base_uri(self) -> str:
+        user_part = f"{self.username}@" if self.username else ""
+        port_part = f":{self.port}" if self.port != SIP_PORT else ""
+        return f"{self.scheme}:{user_part}{self.host}{port_part}"
 
 
 @dataclass
@@ -140,6 +189,9 @@ class CallInfo:
     opus_payload_type: int = OPUS_PAYLOAD_TYPE
     local_rtp_ip: str | None = None
     local_rtp_port: int | None = None
+    contact_endpoint: SipEndpoint | None = None
+    via_host: str | None = None
+    via_port: int | None = None
 
     @property
     def caller_rtcp_port(self) -> int:
@@ -155,6 +207,16 @@ class CallInfo:
     def caller_sip_port(self) -> int:
         """SIP port of caller."""
         return self.caller_endpoint.port
+
+    @property
+    def contact_host(self) -> str | None:
+        """Get host address of contact header."""
+        return self.contact_endpoint.host if self.contact_endpoint is not None else None
+
+    @property
+    def contact_port(self) -> int | None:
+        """SIP port of contact header."""
+        return self.contact_endpoint.port if self.contact_endpoint is not None else None
 
     @property
     def local_rtcp_port(self) -> int | None:
@@ -177,6 +239,9 @@ def get_sip_endpoint(
     scheme: Optional[str] = "sip",
     username: Optional[str] = None,
     description: Optional[str] = None,
+    uri_parameters: Optional[dict[str, str]] = None,
+    uri_headers: Optional[dict[str, str]] = None,
+    header_parameters: Optional[dict[str, str]] = None,
 ) -> SipEndpoint:
     uri = f"{scheme}:"
     if username:
@@ -184,9 +249,55 @@ def get_sip_endpoint(
     uri += host
     if port:
         uri += f":{port}"
+    if uri_parameters:
+        for key, value in uri_parameters.items():
+            if value:
+                uri += f";{key}={value}"
+            else:
+                uri += f";{key}"
+    if uri_headers:
+        parts = [f"{key}={value}" for key, value in uri_headers.items()]
+        uri += "?" + "&".join(parts)
     if description:
         uri = f'"{description}" <{uri}>'
+    if header_parameters:
+        for key, value in header_parameters.items():
+            if value:
+                uri += f";{key}={value}"
+            else:
+                uri += f";{key}"
     return SipEndpoint(uri)
+
+
+def parse_via_header(value: str) -> Optional[Tuple[str, int]]:
+    """Parse the host and port from a Via header."""
+    pattern = re.compile(r"SIP/2\.0/\w+\s+(?P<host>[^:;\s]+)(?::(?P<port>\d+))?")
+    match = pattern.search(value)
+    if not match:
+        return None
+
+    host = match.group("host")
+    port_str = match.group("port")
+    port = int(port_str) if port_str is not None else SIP_PORT
+    return host, port
+
+
+def get_response_host(call_info: CallInfo) -> str:
+    if call_info.via_host:
+        return call_info.via_host
+    if call_info.contact_host:
+        return call_info.contact_host
+
+    return call_info.caller_ip
+
+
+def get_response_port(call_info: CallInfo) -> int:
+    if call_info.via_port:
+        return call_info.via_port
+    if call_info.contact_port:
+        return call_info.contact_port
+
+    return call_info.caller_sip_port
 
 
 def get_rtp_info(body: str) -> RtpInfo:
@@ -255,9 +366,13 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
         self._outgoing_calls: dict[str, int] = {}
 
     def outgoing_call(
-        self, source: SipEndpoint, destination: SipEndpoint, rtp_port: int
+        self,
+        source: SipEndpoint,
+        destination: SipEndpoint,
+        rtp_port: int,
+        contact: Optional[SipEndpoint] = None,
     ) -> CallInfo:
-        """Make an outgoing call from the given source endpoint to the destination endpoint, using the rtp_port for the local RTP port of the call."""
+        """Make an outgoing call from the given source endpoint to the destination and contact endpoint, using the rtp_port for the local RTP port of the call."""
         if self.transport is None:
             raise RuntimeError("No transport available for outgoing call.")
 
@@ -311,7 +426,10 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
 
         self.transport.sendto(
             msg_bytes,
-            (destination.host, destination.port),
+            (
+                contact.host if contact and contact.host else destination.host,
+                contact.port if contact and contact.port else destination.port,
+            ),
         )
 
         invite_msg = SipMessage.parse_sip(invite_text, False)
@@ -322,6 +440,7 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
             caller_rtp_port=rtp_port,
             server_ip=source.host,
             headers=invite_msg.headers,
+            contact_endpoint=contact,
         )
 
     def hang_up(self, call_info: CallInfo):
@@ -344,9 +463,9 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
         _LOGGER.debug("Hanging up...")
         bye_text = _CRLF.join(bye_lines) + _CRLF
         bye_bytes = bye_text.encode("utf-8")
-        self.transport.sendto(
-            bye_bytes, (call_info.caller_endpoint.host, call_info.caller_endpoint.port)
-        )
+        response_host = get_response_host(call_info)
+        response_port = get_response_port(call_info)
+        self.transport.sendto(bye_bytes, (response_host, response_port))
 
         self._end_outgoing_call(call_info.headers["call-id"])
         self.on_hangup(call_info)
@@ -380,9 +499,13 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
         _LOGGER.debug("Canceling call...")
         cancel_text = _CRLF.join(cancel_lines) + _CRLF
         cancel_bytes = cancel_text.encode("utf-8")
+
+        response_host = get_response_host(call_info)
+        response_port = get_response_port(call_info)
+
         self.transport.sendto(
             cancel_bytes,
-            (call_info.caller_endpoint.host, call_info.caller_endpoint.port),
+            (response_host, response_port),
         )
 
         self._end_outgoing_call(get_header(call_info.headers, "call-id")[1])
@@ -435,7 +558,7 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
                     raise ValueError("Empty receiver URI")
 
                 caller_endpoint = None
-                # The From header should give us the URI used for sending SIP messages to the device
+                # The From header should give us the URI used for identifying the device
                 if smsg.headers.get("from") is not None:
                     caller_endpoint = SipEndpoint(smsg.headers.get("from", ""))
                 # We can try using the Contact header as a fallback
@@ -444,6 +567,23 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
                 # If all else fails try to generate a URI based on the IP and port from the address the message came from
                 else:
                     caller_endpoint = get_sip_endpoint(caller_ip, port=caller_sip_port)
+
+                # We need to get the URI needed for initiating messages to the device from the Contact header
+                if smsg.headers.get("contact") is not None:
+                    contact_endpoint = SipEndpoint(smsg.headers.get("contact", ""))
+                # If all else fails try to generate a URI based on the IP and port from the address the message came from
+                else:
+                    contact_endpoint = get_sip_endpoint(caller_ip, port=caller_sip_port)
+
+                # We need to get the URI needed for sending replies to the device from the Via header
+                if smsg.headers.get("via") is not None and (
+                    via_result := parse_via_header(smsg.headers.get("via"))
+                ):
+                    via_host, via_port = via_result
+                # If all else fails use the Contact header, which may have been generated based on the IP and port the message came from
+                else:
+                    via_host = contact_endpoint.host
+                    via_port = contact_endpoint.port
 
                 local_endpoint = None
                 if smsg.headers.get("to") is not None:
@@ -516,6 +656,9 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
                         server_ip=server_ip,
                         headers=smsg.headers,
                         opus_payload_type=opus_payload_type,
+                        contact_endpoint=contact_endpoint,
+                        via_host=via_host,
+                        via_port=via_port,
                     )
                 )
             elif method is None:
@@ -546,7 +689,13 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
                     ]
                     ack_text = _CRLF.join(ack_lines) + _CRLF
                     ack_bytes = ack_text.encode("utf-8")
-                    self.transport.sendto(ack_bytes, (caller_ip, caller_sip_port))
+                    via_result = parse_via_header(smsg.headers["via"])
+                    if via_result:
+                        response_host, response_port = via_result
+                    else:
+                        response_host = caller_ip
+                        response_port = caller_sip_port
+                    self.transport.sendto(ack_bytes, (response_host, response_port))
                     return
                 if not is_ok:
                     _LOGGER.debug("Received non-OK response [%s]", message)
@@ -568,7 +717,7 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
                     caller_endpoint = SipEndpoint(smsg.headers.get("to", ""))
                 else:
                     caller_endpoint = get_sip_endpoint(caller_ip, port=caller_sip_port)
-                # The From header should give us the URI used for sending SIP messages to the device
+                # The From header should give us the URI used for identifying the device
                 local_endpoint = None
                 if smsg.headers.get("from") is not None:
                     local_endpoint = SipEndpoint(smsg.headers.get("from", ""))
@@ -621,6 +770,23 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
                 else:
                     caller_endpoint = get_sip_endpoint(caller_ip, port=caller_sip_port)
 
+                # We need to get the URI needed for initiating messages to the device from the Contact header
+                if smsg.headers.get("contact") is not None:
+                    contact_endpoint = SipEndpoint(smsg.headers.get("contact", ""))
+                # If all else fails try to generate a URI based on the IP and port from the address the message came from
+                else:
+                    contact_endpoint = get_sip_endpoint(caller_ip, port=caller_sip_port)
+
+                # We need to get the URI needed for sending replies to the device from the Via header
+                if smsg.headers.get("via") is not None and (
+                    via_result := parse_via_header(smsg.headers.get("via"))
+                ):
+                    via_host, via_port = via_result
+                # If all else fails use the Contact header, which may have been generated based on the IP and port the message came from
+                else:
+                    via_host = contact_endpoint.host
+                    via_port = contact_endpoint.port
+
                 local_endpoint = None
                 if smsg.headers.get("to") is not None:
                     local_endpoint = SipEndpoint(smsg.headers.get("to", ""))
@@ -649,25 +815,30 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
                 ]
                 ok_text = _CRLF.join(ok_lines) + _CRLF
                 ok_bytes = ok_text.encode("utf-8")
+
+                call_info = CallInfo(
+                    caller_endpoint=caller_endpoint,
+                    local_endpoint=local_endpoint,
+                    caller_rtp_port=remote_rtp_port,
+                    server_ip=remote_rtp_ip,
+                    headers=smsg.headers,
+                    contact_endpoint=contact_endpoint,
+                    via_host=via_host,
+                    via_port=via_port,
+                )
                 # We should probably tell the associated RTP server to shutdown at this point, assuming we aren't reusing it for other calls
                 _LOGGER.debug("Sending OK for BYE message: %s", ok_text)
+                response_host = get_response_host(call_info)
+                response_port = get_response_port(call_info)
                 self.transport.sendto(
                     ok_bytes,
-                    (caller_ip, caller_sip_port),
+                    (response_host, response_port),
                 )
                 # The transport might be used for incoming calls
                 # as well, so we should leave it open.
 
                 # Cleanup any necessary call state
-                self.on_hangup(
-                    CallInfo(
-                        caller_endpoint=caller_endpoint,
-                        local_endpoint=local_endpoint,
-                        caller_rtp_port=remote_rtp_port,
-                        server_ip=remote_rtp_ip,
-                        headers=smsg.headers,
-                    )
-                )
+                self.on_hangup(call_info)
 
         except Exception:
             _LOGGER.exception("Unexpected error handling SIP message")
@@ -713,10 +884,30 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
         ]
         body = _CRLF.join(body_lines)
 
+        to_header = SipEndpoint(call_info.headers["to"])
+        # Check if the TO header already includes a tag
+        if "tag" not in to_header.header_parameters:
+            new_params = (
+                to_header.header_parameters.copy()
+                if to_header.header_parameters
+                else {}
+            )
+            new_params["tag"] = secrets.token_hex(8)
+            to_header = get_sip_endpoint(
+                host=to_header.host,
+                port=to_header.port if to_header.port != SIP_PORT else None,
+                scheme=to_header.scheme,
+                username=to_header.username,
+                description=to_header.description,
+                uri_parameters=to_header.uri_parameters,
+                uri_headers=to_header.uri_headers,
+                header_parameters=new_params,
+            )
+
         response_headers = {
             "Via": call_info.headers["via"],
             "From": call_info.headers["from"],
-            "To": call_info.headers["to"],
+            "To": to_header.sip_header,  # Append the tag if necessary
             "Call-ID": call_info.headers["call-id"],
             "Content-Type": "application/sdp",
             "Content-Length": len(body),
@@ -734,13 +925,16 @@ class SipDatagramProtocol(asyncio.DatagramProtocol, ABC):
         response_str = _CRLF.join(response_lines) + body
         response_bytes = response_str.encode()
 
+        response_host = get_response_host(call_info)
+        response_port = get_response_port(call_info)
+
         self.transport.sendto(
             response_bytes,
-            (call_info.caller_ip, call_info.caller_sip_port),
+            (response_host, response_port),
         )
         _LOGGER.debug(
             "Sent OK to ip=%s, port=%s with rtp_port=%s",
-            call_info.caller_ip,
-            call_info.caller_sip_port,
+            response_host,
+            response_port,
             server_rtp_port,
         )

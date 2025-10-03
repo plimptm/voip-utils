@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.4
+
+- Add tag parameter to To header if missing
+- Use header values for response host and port
+
 ## 0.3.3
 
 - Handle empty lines at start of message
