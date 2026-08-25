@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.3
+
+- Clear queues on disconnect
+
+## 0.4.2
+
+- Remove upper limit on python version
+
+## 0.4.1
+
+- Move RTP audio output processing to separate task to maintain consistent schedule with silence sent when there is no active audio
+
+## 0.4.0
+
+- Update to opuslib-next
+
+## 0.3.5
+
+- Cleanup RTP/RTCP servers on hangup
+
 ## 0.3.4
 
 - Add tag parameter to To header if missing
